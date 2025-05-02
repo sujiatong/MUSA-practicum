@@ -8,15 +8,10 @@ let geojsonLayer;
 let allData;
 let allCounties;
 
-Promise.all([
-    fetch('data/WA_county_agg_summary.geojson').then(res => res.json()),
-    fetch('data/wa_counties.geojson').then(res => res.json())
-  ]).then(([data, counties]) => {
-    allData = data;
-    allCounties = counties;
-    populateUtilityOptions(allData);
-    updateMap(); // 初始載入
-  });
+allData = summaryData;
+allCounties = countiesData;
+populateUtilityOptions(allData);
+updateMap();
 
 
 function populateUtilityOptions(data) {
