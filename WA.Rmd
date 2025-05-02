@@ -1,0 +1,728 @@
+---
+title: "WA_state"
+date: "2025-04-23"
+output:
+  html_document:
+    theme: simplex
+    toc: yes
+    toc_float: yes
+    progress: hide
+    code_folding: hide
+    code_download: yes
+  params:
+  include_warnings: false  # Add this line to suppress warnings
+  
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+setwd('/Users/jiatong/Desktop/MUSA-practicum')
+rm(list = ls())
+library(httr)
+library(jsonlite)
+library(sf)
+library(knitr)
+library(ggplot2)
+
+library(tidycensus)
+library(dplyr)
+library(sf)
+library(tidyverse)
+library(tidyr)
+```
+
+# Introduction
+
+Utility disconnection refers to the cuts off service due to non-payment. Million of households across the United States face utility disconnections because they are unable to afford their bills, highlighting a significant and widespred issue of energy insecurity.
+
+The following analysis aggregate utility disconnection rate data from zip codes to counties in order to reveal broader geographic patterns and disparities.
+
+
+# File import - data pre-processing
+
+To aggregating the zip code to counties level, I will use the [HUD](https://www.huduser.gov/portal/dataset/uspszip-api.html) zip code crosswalk data.
+This dataset provides robust way to reapportion data from zip code to geographic units, such as county level, tract level.
+
+In some case, some zip codes crosswalk mutiple county.
+This data provide the address ratio for each zip code.
+in the following examination, i will following [Wilson and Din (2018)](https://www.huduser.gov/portal/periodicals/cityscpe/vol20num2/ch16.pdf) suggestion, remove the duplicating zip code that determines the county base on the largest ratio.
+
+
+## HUD zip code crosswalk data
+
+The following code chunk that imports [HUD](https://www.huduser.gov/portal/dataset/uspszip-api.html) zip code crosswalk data.
+
+[HUD](https://www.huduser.gov/portal/dataset/uspszip-api.html) utilize use of the geographical information of USPS delivery points to allocate them to geographic units (such as Census Tracts or Counties).
+HUD establishes proportionally weighted variables, such as res_ratio, bus_ratio, etc, indicating which geographical unit each address in a certain ZIP Code is distributed.
+
+```{r WA_crosswalk}
+key <- "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiI2IiwianRpIjoiODk1ZWRlZDM4MjgwOTIyZDFlY2Q2MmYxMjMwODcwMDYwNGYxNTZiYzE5NWEzYmJlMmYwMGRhMmY5MDQ0MzI3N2YzM2E3NGE0M2Q2ZjY2ZmIiLCJpYXQiOjE3NDM3MDY1NDkuNzYyMzcxLCJuYmYiOjE3NDM3MDY1NDkuNzYyMzc0LCJleHAiOjIwNTkyMzkzNDkuNzQ0NzQ1LCJzdWIiOiI5NDUxMSIsInNjb3BlcyI6W119.aw4CshBNx4n3m-y1jjt1OrNh28BaRr3mNBH51OptRk_FCNZk8Su68E06d6tZ7UViafXsSeI1-OzazhGqnMzSJA"
+url <- "https://www.huduser.gov/hudapi/public/usps"
+
+# Send the GET request
+response_WA <- httr::GET(url, query = list(type = 2, query = "WA"), 
+                         add_headers(Authorization = paste("Bearer", key)))
+
+# Check for errors
+if (httr::http_error(response_WA)) {
+  stop("Error: ", httr::http_status(response_WA)$message)
+}
+
+# Access the output as text
+outputWA <- httr::content(response_WA, as = "text", encoding = "UTF-8")
+
+# Parse JSON content from the text
+output_json_WA <- fromJSON(outputWA)
+
+# Convert to data frame (check if it's nested first)
+WA_crosswalk <- as.data.frame(output_json_WA)
+
+# View the first few rows
+kable(head(WA_crosswalk))
+
+```
+
+## Census for County_FIPS
+
+> [County adjacency file](https://www.census.gov/geographies/reference-files/time-series/geo/county-adjacency.html) provide the reference of GEOID in Census data, which also provide the actual county name.
+>
+
+> Since HUD file does not have County name, but it contains `data.results.geoid`, which is county of GEOID.
+>
+> Census provide the reference of GEOID in Census data, which also provide the actual county name.
+
+
+```{r census, results='hide'}
+
+# Set your Census API key (only once per session)
+# census_api_key("YOUR_API_KEY", install = TRUE)
+
+# Get WA county geometries
+WA_counties <- get_acs(
+  geography = "county",
+  state = "WA",
+  variables = "B01003_001",  # total population (placeholder variable)
+  geometry = TRUE,
+  year = 2021
+) %>%
+  select(GEOID, NAME, geometry)
+
+
+```
+
+```{r}
+kable(head(WA_counties))
+
+```
+
+```{r, include=FALSE}
+#st_write(WA_counties,"/Users/jiatong/Desktop/MUSA-practicum/WA/data/WA_counties.geojson", driver = "GeoJSON")
+```
+
+## Merging census and HUD crosswalk data to get the county name
+
+> The following code chunk merges census data with HUD crosswalk data to obtain the corresponding county names.
+
+```{r}
+
+# Convert both columns to character if they are not already
+#OR_counties$County_FIPS <- as.character(OR_counties$County_FIPS)
+WA_crosswalk$data.results.geoid <- as.character(WA_crosswalk$data.results.geoid)
+WA_counties$GEOID <- as.character(WA_counties$GEOID)
+
+# Check column names
+#colnames(OR_counties)
+# colnames(OR_data)
+
+# Merge by GEOID and County_FIPS
+merged_data_WA <- merge(WA_counties, WA_crosswalk, by.x = "GEOID", by.y = "data.results.geoid", all.x = TRUE)
+
+# Display the merged data
+kable(head(merged_data_WA))
+```
+
+## Removing the duplicating zip code
+
+
+Sometimes, Zip code do not corresponds to administrative boundaries, such as county, city, and tract (Din, A. 2021; Wilson, R., & Din, A. 2018; Din, A., & Wilson, R. 2020).
+Therefore, duplicate zip code will exist.
+
+To address duplicating zip code, it need to determine the zip code in certian county.
+I will following [Wilson and Din (2018)](https://www.huduser.gov/portal/periodicals/cityscpe/vol20num2/ch16.pdf) suggestion, remove the duplicating zip code that determines the county base on the largest ratio.
+
+
+
+```{r}
+# Remove duplicates and keep rows with the maximum data.results.tot_ratio for each ZIP code
+
+filtered_data_WA <- merged_data_WA %>%
+  group_by(data.results.zip) %>%
+  filter(data.results.tot_ratio == max(data.results.tot_ratio)) %>%
+  ungroup() %>% 
+  select(-data.year, -data.quarter, -data.results.state)
+
+# View the filtered data
+kable(head(filtered_data_WA))
+```
+
+```{r, include=FALSE}
+res_data_WA <- merged_data_WA %>%
+  group_by(data.results.zip) %>%
+  filter(data.results.res_ratio == max(data.results.res_ratio)) %>%
+  ungroup() %>% 
+  select(-data.year, -data.quarter, -data.results.state)
+
+# View the filtered data
+kable(head(res_data_WA))
+```
+
+## Utility data
+
+> Importing utility data of Washington state in the following code chunk
+
+```{r WA, message=FALSE}
+
+WA <- read_csv("State-Specific Data/WA_2019-2024.csv")
+colnames(WA)
+```
+
+# Merging utility data with zip code data
+
+```{r}
+# Convert both columns to character if they are not already
+filtered_data_WA$data.results.zip <- as.character(filtered_data_WA$data.results.zip)
+WA$zip_code <- as.character(WA$zip_code)
+
+merged_utility_WA <- merge(WA, filtered_data_WA, by.x = "zip_code", by.y = "data.results.zip", all.x = TRUE)
+
+```
+
+```{r, include=FALSE}
+merged_utility_WA %>% filter(is.na(NAME)) %>% distinct(zip_code)
+#nrow(merged_utility_WA %>% filter(is.na(GEOID))):166
+
+```
+
+> Since the dataset includes some ambiguous or invalid ZIP codes, but we still want to retain those records, I manually filled in the `NAME` column based on known ZIP-to-county matches.
+> Some of these ZIP codes do **not** belong to Washington State, so I explicitly marked invalid entries and accurately assigned counties for out-of-state ZIPs where applicable.
+
+  - Mutates merged_utility_WA by updating two columns: NAME and data.results.tot_ratio.
+  - Fills NAME based on specific zip_code matches (assigning county names or "Invalid" if unmatched).
+  - Sets data.results.tot_ratio to 1 for those specific zip_code values listed.
+  - Leaves original NAME and data.results.tot_ratio unchanged if the zip_code does not match.
+
+```{r}
+merged_utility_WA <- merged_utility_WA %>%
+  mutate(
+    NAME = case_when(
+      zip_code == 97031 ~ "Hood River County, Oregon",
+      zip_code == 97301 ~ "Marion County, Oregon",
+      zip_code == 97388 ~ "Lincoln County, Oregon",
+      zip_code == 97663 ~ "Klamath County, Oregon",
+      zip_code == 98307 ~ "Pierce County, Washington",
+      zip_code == 98762 ~ "Invalid",
+      zip_code == 98864 ~ "Chelan County, Washington",
+      zip_code == 99107 ~ "Stevens County, Washington",
+      TRUE ~ NAME
+    ),
+    data.results.tot_ratio = ifelse(zip_code %in% c(97031, 97301, 97388, 97663, 98307, 98762, 98864, 99107), 1, data.results.tot_ratio)
+  )
+
+
+```
+
+```{r,include=FALSE}
+merged_utility_WA %>% distinct(NAME)
+WA_counties %>% distinct(NAME)
+```
+
+```{r, include=FALSE}
+res_data_WA$data.results.zip <- as.character(res_data_WA$data.results.zip)
+WA$zip_code <- as.character(WA$zip_code)
+
+merged_utility_WA_res <- merge(WA, res_data_WA, by.x = "zip_code", by.y = "data.results.zip", all.x = TRUE) 
+
+merged_utility_WA_res <- merged_utility_WA_res %>%
+  mutate(NAME = case_when(
+    zip_code == 97031 ~ "Hood River County, Oregon",
+    zip_code == 97301 ~ "Marion County, Oregon",
+    zip_code == 97388 ~ "Lincoln County, Oregon",
+    zip_code == 97663 ~ "Klamath County, Oregon",
+    zip_code == 98307 ~ "Pierce County, Washington",
+    zip_code == 98762 ~ "Invalid",
+    zip_code == 98864 ~ "Chelan County, Washington",
+    zip_code == 99107 ~ "Stevens County, Washington",
+    TRUE ~ NAME  # ⭐️ keep the original NAME for all others
+  ))
+```
+
+```{r, include=FALSE}
+merged_utility_WA_1 <- merged_utility_WA %>% 
+  mutate(      
+    est_disconnections = number_of_disconnections * data.results.tot_ratio,
+    difference = number_of_disconnections - est_disconnections,
+    PCT_DIF = ifelse(number_of_disconnections == 0, NA,
+                     100 * (est_disconnections - number_of_disconnections) / number_of_disconnections),
+    mae = abs(difference),  
+    mape = case_when(
+      number_of_disconnections == 0 & est_disconnections == 0 ~ 0,  
+      number_of_disconnections == 0 ~ NA_real_,                   
+      TRUE ~ abs(difference) / number_of_disconnections * 100     
+    )
+  )
+
+
+
+```
+
+
+# Aggregating
+
+The code aggregates utility disconnection data at the **county level** in Washington State by grouping the dataset `merged_utility_WA` based on `NAME` (county), `year`, `month`, and `utility_name`.
+The resulting summary table `WA_county_agg` includes:
+
+-   **`total_disconnections`**: The total number of reported utility disconnections in each group.
+
+-   **`est_disconnections`**: The estimated number of disconnections, adjusted using a weighting factor (`data.results.tot_ratio`), which accounts for partial ZIP-to-county mappings.
+
+-   **`avg_disconnection_rate`**: The average disconnection count per record in each zip code
+
+-   **`difference`**: The numerical difference between the **`total_disconnections`** and **`est_disconnections`** totals, which can help assess the impact of the weighting method.
+
+- **`PCT_DIF`**: the precentage of **`difference`**
+- **`mae`** (Mean Absolute Error): mean of absolute differences between total_disconnections and est_disconnections
+
+- **`mape`**(Mean Absolute Percentage Error):
+the percentage equivalent of mean absolute error (MAE), measuring the accuracy between total_disconnections and est_disconnections
+
+```{r}
+WA_county_agg <- merged_utility_WA %>%
+  group_by(NAME, year, month, utility_name) %>%
+  summarise(
+    total_disconnections = sum(number_of_disconnections, na.rm = TRUE),
+    est_disconnections = sum(number_of_disconnections * data.results.tot_ratio, na.rm = TRUE),
+    avg_disconnection_rate = mean(number_of_disconnections, na.rm = TRUE),
+    difference = sum(total_disconnections - est_disconnections, na.rm = TRUE),  
+    PCT_DIF = case_when(
+      sum(number_of_disconnections, na.rm = TRUE) == 0 & sum(est_disconnections, na.rm = TRUE) == 0 ~ 0,
+      sum(number_of_disconnections, na.rm = TRUE) == 0 ~ NA_real_,
+      TRUE ~ 100 * (sum(est_disconnections, na.rm = TRUE) - sum(number_of_disconnections, na.rm = TRUE)) / sum(number_of_disconnections, na.rm = TRUE)
+    ),
+    mae = abs(sum(difference, na.rm = TRUE)),
+    mape = case_when(
+      sum(number_of_disconnections, na.rm = TRUE) == 0 & sum(est_disconnections, na.rm = TRUE) == 0 ~ 0,
+      sum(number_of_disconnections, na.rm = TRUE) == 0 ~ NA_real_,
+      TRUE ~ abs(sum(difference, na.rm = TRUE)) / sum(number_of_disconnections, na.rm = TRUE) * 100
+    ),
+    .groups = "drop"   
+  )
+
+kable(head(WA_county_agg))
+```
+
+```{r, include=FALSE}
+#WA_county_agg_geo_full <- WA_county_agg %>%
+  #left_join(WA_counties, by = "NAME") %>%
+  #st_as_sf()
+
+#st_write(WA_county_agg_geo_full,"/Users/jiatong/Desktop/MUSA-practicum/WA/data/WA_county_agg_summary.geojson", driver = "GeoJSON")
+```
+
+> The followng plot visulazie Cumulative Total Disconnections in Disconnection Estimates (2019–2024)
+
+```{r}
+# Step 1: group by NAME + year，summary total_disconnections
+WA_county_agg_summary <- WA_county_agg %>%
+  group_by(NAME, year) %>%
+  summarise(
+    total_disconnections = sum(total_disconnections, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 2: creating grid
+county_year_grid <- expand_grid(
+  NAME = unique(WA_counties$NAME),
+  year = unique(WA_county_agg_summary$year)
+)
+
+# Step 3: Left join
+WA_county_agg_geo <- county_year_grid %>%
+  left_join(WA_counties, by = "NAME") %>%
+  left_join(WA_county_agg_summary, by = c("NAME", "year")) %>%
+  st_as_sf()
+
+# Step 4: 
+ggplot(WA_county_agg_geo) +
+  geom_sf(aes(fill = total_disconnections), color = "white") +
+  facet_wrap(~ year) +
+  scale_fill_viridis_c(option = "plasma", trans = "sqrt", na.value = "grey80") +
+  labs(
+    title = "Cumulative Total Disconnections in Disconnection Estimates (2019–2024)",
+    fill = "Total Disconnections",
+    caption = "Source: Aggregated ZIP-to-County Estimates\nUnit: Disconnection Count Difference"
+  ) +
+  theme_minimal() +
+    theme(
+    axis.text = element_blank(),   
+    axis.ticks = element_blank(),  
+    panel.grid = element_blank()  
+  )
+
+```
+
+
+```{r, include=FALSE}
+merged_utility_WA_res <- merged_utility_WA_res %>%#fillter_utility_OR
+  group_by(NAME, year, month, utility_name) %>%
+  summarise(
+    total_disconnections = sum(number_of_disconnections, na.rm = TRUE),  
+    # Sum of disconnections
+    est_disconnections = sum(number_of_disconnections*data.results.res_ratio, na.rm = TRUE),
+
+    avg_disconnection_rate = mean(number_of_disconnections, na.rm = TRUE), 
+    difference = total_disconnections - est_disconnections,
+    # Average disconnection rate
+    #num_zip_codes = n_distinct(zip_code),  # Count unique ZIP codes per county
+    .groups = "drop"
+  )
+
+kable(head(merged_utility_WA_res))
+```
+
+# Validating
+
+## comparing **total_disconnections and est_disconnections**
+
+> this section mainly focus Din, A., & Wilson, R.
+(2020) suggestion that comparing actual count (total_disconnections) and estimate.
+>
+
+To validate the ZIP-to-county aggregation using HUD-provided weighting ratios (`data.results.tot_ratio`), I compared the **raw total disconnection** with the **estimated total disconnections** after applying the weights.
+
+In previous aggregating step, `WA_county_agg` aggregating the disconnection data by county, utility company, year, and month.
+ -   `total_disconnections`: the unweighted sum of disconnections reported within each group.
+
+ -   `est_disconnections`: the weighted sum, using the ratio to estimate each ZIP's contribution to the county.
+
+> Measuring the impact of weighting
+>
+> To evaluate how much the weighting affected the total count:
+>
+ -   I summed the **unweighted totals** (`total_disconnections`) across all counties, resulting in **86,388 disconnections**.
+
+ -   I summed the **weighted totals**(`est_disconnections`), yielding **85,621.34 disconnections**.
+
+ -   The **absolute difference** between the two totals was **766.66 disconnections**, indicating the net shift caused by applying HUD’s weighting.
+
+```{r}
+print(paste("rows - unweighted total(sum of number_of_disconnections):", sum(WA_county_agg$total_disconnections)))
+print(paste("rows - weighted total(est_disconnection) :", sum(WA_county_agg$est_disconnections)))
+print(paste("Difference (impact of weighting):", sum(WA_county_agg$difference)))
+
+```
+
+```{r, include=FALSE}
+print(paste("rows - unweighted total(sum of number_of_disconnections):", sum(merged_utility_WA_res$total_disconnections)))
+print(paste("rows - weighted total(est_disconnection) :", sum(merged_utility_WA_res$est_disconnections)))
+print(paste("Difference (impact of weighting):", sum(merged_utility_WA_res$difference)))
+
+```
+
+> **Relative difference**
+>
+> To contextualize this shift, I calculated the **relative difference** as a percentage of the unweighted total:
+
+```{r}
+relative_diff <- sum(WA_county_agg$difference) / sum(WA_county_agg$total_disconnections)* 100
+print(paste("Relative Difference (%):", round(relative_diff, 2), "%"))
+```
+
+The **0.89% relative difference** indicates that applying the ZIP-to-county weighting introduces **minimal deviation** from the raw totals.
+This result supports the feasibility of using HUD's crosswalk-based ratios to estimate disconnections at the county level, even in the absence of point-level utility data.
+
+**"Having a high kurtosis is an ideal characteristic of a difference distribution because it indicates that most of the differences are not large and are similar to the average."**\
+— *Wilson, R., & Din, A. (2018)*
+
+```{r}
+# Create a summarized table: actual vs estimated
+county_comparison <- WA_county_agg %>%
+  group_by(NAME) %>%
+  summarise(
+    actual_total = sum(total_disconnections, na.rm = TRUE),
+    estimated_total = sum(est_disconnections, na.rm = TRUE)
+  ) %>%
+  arrange(desc(actual_total))  # optional: sort by actual
+
+
+
+# Reshape for visualization
+county_long <- county_comparison %>%
+  pivot_longer(cols = c("actual_total", "estimated_total"),
+               names_to = "type", values_to = "value")
+
+# Plot
+ggplot(county_long, aes(x = reorder(NAME, -value), y = value, fill = type)) +
+  geom_col(position = "dodge") +
+  labs(title = "Actual vs Estimated Utility Disconnections by County",
+       x = "County", y = "Number of Disconnections") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r, include=FALSE}
+## Pearson correlation measure the linear relationship
+
+# Scatter plot with trend line
+ggplot(WA_county_agg, aes(x = total_disconnections, y = (est_disconnections))) +
+  geom_point(color = "steelblue", size = 3, alpha = 0.7) +  # scatter points
+  geom_smooth(method = "lm", se = FALSE, color = "darkred", linetype = "dashed") +  # linear trend line
+  geom_abline(intercept = 0, slope = 1, color = "gray", linetype = "dotted") +  # reference line y = x
+  labs(
+    title = "Actual vs Estimated Utility Disconnections by County",
+    x = "Actual Disconnections (Unweighted)",
+    y = "Estimated Disconnections (Weighted)"
+  ) +
+  theme_minimal()
+```
+
+```{r, include=FALSE}
+
+summary(merged_utility_WA$ratio)
+length(unique(merged_utility_WA$ratio))
+
+```
+
+```{r, include=FALSE}
+
+# <https://www.sciencedirect.com/science/article/pii/S1051200419301289#bbr0610>
+
+correlation <- cor(
+  WA_county_agg$total_disconnections,
+  WA_county_agg$est_disconnections,
+  use = "complete.obs"
+)
+
+print(paste("Correlation:", round(correlation, 3)))
+```
+
+## Evaluation Metrics
+
+In this section, I'm gonna to **Calculate Evaluation Metrics**, which quantify the estimation error across all grouped observations (by county, month, and utility):
+
+MAE (Mean Absolute Error): mean of absolute differences between total_disconnections and est_disconnections
+- MAE is not a normalized metric and is dependent on the scale of the data. This means that an MAE value of 10 might be considered good for predicting millions, but poor for predicting values in the range of 2 digits. 
+
+
+$$
+\text{Mean Absolute Error} = \frac{1}{n} \sum_{i=1}^{n} \left| \text{total_disconnections}_i - \text{est_disconnections}_i \right|
+$$
+
+-   MAE value range is 0 from infinity, therefore, less than 1 indicting good accuracy.
+
+MAPE (Mean Absolute Percentage Error):
+
+the percentage equivalent of mean absolute error (MAE), measuring the accuracy between total_disconnections and est_disconnections
+
+$$
+\text{Mean Percentage Error} = \frac{1}{n} \sum_{i=1}^{n} \left( \frac{\text{total_disconnections} - \text{est_disconnections}_i}{\text{total_disconnections}_i} \right) \times 100
+$$
+
+
+
+-   <https://www.vexpower.com/brief/mean-absolute-percentage-error>
+
+-   <https://www.researchgate.net/publication/257812432_Using_the_R-MAPE_index_as_a_resistant_measure_of_forecast_accuracy>
+
+```{r Calculate metrics}
+
+mae <- mean(WA_county_agg$mae, na.rm = TRUE)
+mape <- mean(WA_county_agg$mape, na.rm = TRUE)  # percentage
+rmse <- sqrt(mean((WA_county_agg$total_disconnections - WA_county_agg$est_disconnections)^2, na.rm = TRUE))
+
+print(paste("MAE:", round(mae, 2)))
+print(paste("MAPE (%):", round(mape, 2)))
+#print(paste("RMSE:", round(rmse, 2)))
+
+```
+
+In overall dataset, the MAE is less than 1, representing high accuracy.
+
+The following plot visualize the MAPE of aggregating to county from 2019 to 2024, showing the difference percentage between the total_disconnections and est_disconnections.
+
+> [Montaño, Juan, and Palmer et al](https://www.researchgate.net/publication/257812432_Using_the_R-MAPE_index_as_a_resistant_measure_of_forecast_accuracy). suggest that a MAPE below 20% indicates good accuracy.
+> In general, the MAPE across Washington State remains under this 20% threshold.
+
+```{r, include=FALSE}
+county_error_summary <- WA_county_agg %>% #filter(year == 2022) %>% 
+  #filter(month == 'June') %>% 
+  group_by(NAME, year) %>%
+  summarise(
+    total_abs_error = sum(mae, na.rm = TRUE),
+    total_disconnections = sum(total_disconnections, na.rm = TRUE),
+    total_est_disconnections = sum(est_disconnections, na.rm = TRUE),
+    mape = (total_abs_error / total_disconnections) * 100,  # Percent form
+    .groups = "drop"
+  )
+
+
+# Join error summary to spatial data
+county_error_map <- WA_counties %>%
+  left_join(county_error_summary, by = "NAME")
+
+library(ggplot2)
+
+ggplot(county_error_map) +
+  geom_sf(aes(fill = mape), color = "white") +
+   facet_wrap(~ year) +
+  scale_fill_viridis_c(option = "plasma", trans = "sqrt") +
+  labs(
+    title = "Cumulative MAPE in Disconnection Estimates (2019–2024)",
+    fill = "MAPE",
+    caption = "Source: Aggregated ZIP-to-County Estimates\nUnit: Disconnection Count Difference"
+  ) +
+  theme_minimal()
+```
+
+
+> The following plot visualizes the MAPE of disconnection estimates from 2019 to 2024. Overall, the plot shows that MAPE values are generally below 20% for each county, indicating good accuracy.
+
+
+```{r}
+
+
+# Step 1: make sure each year have County
+county_year_grid <- expand_grid(
+  NAME = unique(WA_counties$NAME),
+  year = unique(WA_county_agg$year)
+)
+
+# Step 2: summary error summary
+county_error_summary <- WA_county_agg %>%
+  group_by(NAME, year) %>%
+  summarise(
+    total_abs_error = sum(mae, na.rm = TRUE),
+    total_disconnections = sum(total_disconnections, na.rm = TRUE),
+    total_est_disconnections = sum(est_disconnections, na.rm = TRUE),
+    mape = (total_abs_error / total_disconnections) * 100,  # Percent form
+    .groups = "drop"
+  )
+
+# Step 3: using grid left_join，let no data be NA value
+county_error_complete <- county_year_grid %>%
+  left_join(county_error_summary, by = c("NAME", "year"))
+
+# Step 4:  join spatial
+county_error_map <- WA_counties %>%
+  left_join(county_error_complete, by = "NAME")  
+
+# Step 5: 
+ggplot(county_error_map) +
+  geom_sf(aes(fill = mape), color = "white") +
+  facet_wrap(~ year) +
+  scale_fill_viridis_c(option = "plasma", trans = "sqrt", na.value = "grey80") +
+  labs(
+    title = "Cumulative MAPE in Disconnection Estimates (2019–2024)",
+    fill = "MAPE",
+    caption = "Source: Aggregated ZIP-to-County Estimates\nUnit: Disconnection Count Difference"
+  ) +
+  theme_minimal() +
+      theme(
+    axis.text = element_blank(),   
+    axis.ticks = element_blank(),  
+    panel.grid = element_blank()  
+  )
+
+
+```
+
+# Limitation
+
+-  In this study, when aggregating utility data from ZIP code to county levels, it is not feasible to directly validate the accuracy of the estimates.
+
+-   As noted by Din and Wilson (2020), when aggregating data, it is unlikely to have point-level information available; otherwise, there would be no need to perform crosswalk processing.
+
+-   Although direct validation is not possible, examining differences between estimated and actual counts may reveal additional patterns of utility disconnection rate, which can be further explored through more detailed spatial analysis.
+
+<!-- -->
+#### MAPE > 20% and MAE > 1 within the zip code level data
+
+--- MAPE: the percentage equivalent of mean absolute error (MAE), measuring the accuracy between ``total_disconnections`` and ``est_disconnections``
+
+--- mean of absolute differences between ``total_disconnections`` and ``est_disconnections``
+
+MAPE measures percentage error; MAE measures the average absolute difference between actual and estimated disconnections.
+
+> In the following analysis, 79 out of 13,730 ZIP code-level records show a MAPE greater than 20% and a MAE greater than 1.
+
+-- Some small disconnection counts can lead to a large percentage difference (high MAPE). Therefore, we also examine the MAE:
+a MAE less than 1 indicates a high level of accuracy despite a seemingly large MAPE.
+
+-- As we lack point-level data, a precise one-to-one match between ``total_disconnections`` and ``est_disconnections`` values at the ZIP code level is not feasible.
+
+
+
+>Among 13,730 ZIP code-level records, only 79 records (0.58%) showed a MAPE greater than 20% and a MAE greater than 1.
+
+
+```{r}
+kable(head(
+  merged_utility_WA_1 %>% 
+    filter(mape >20 & mae > 1) %>% 
+    select(-data.crosswalk_type, -data.input, -data.results.city, -geometry, -data.results.res_ratio, -data.results.bus_ratio, -data.results.oth_ratio, -GEOID, -state)
+  ))
+```
+
+
+
+> Among 1712 county-level records, only 2 records showed a MAPE greater than 20% and a MAE greater than 1.
+
+```{r}
+kable(
+  WA_county_agg %>% 
+    filter(mape >20 & mae > 1) 
+  )
+```
+
+
+> **Given the absence of point-level disconnection data, this very low error rate demonstrates strong model accuracy at the ZIP code aggregation level.**
+
+
+# Reference
+
+Din, A., & Wilson, R.
+(2020).
+Crosswalking ZIP Codes to Census Geographies: Geoprocessing the U.S.
+Department of Housing & Urban Development’s ZIP Code Crosswalk Files. 
+*Cityscape: A Journal of Policy Development and Research, 22*(1), 293–298.
+U.S.
+Department of Housing and Urban Development. 
+<https://www.huduser.gov/portal/periodicals/cityscpe/vol22num1/ch12.pdf>​
+
+Wilson, R., & Din, A.
+(2018).
+Understanding and enhancing the U.S.
+Department of Housing and Urban Development’s ZIP Code Crosswalk Files. 
+*Cityscape: A Journal of Policy Development and Research, 20*(2), 277–294. 
+<https://www.huduser.gov/portal/periodicals/cityscpe/vol20num2/ch16.pdf>​
+
+Din, A.
+(2021).
+New Data Fields for HUD Aggregated USPS Administrative Data on Address Vacancies.
+*Cityscape*, *23*(3), 283–294.
+<https://www.jstor.org/stable/48636236>
+
+Montaño, Juan & Palmer, Alfonso & Sesé, Albert & Cajal, Berta.
+(2013).
+Using the R-MAPE index as a resistant measure of forecast accuracy.
+Psicothema.
+25.
+500-506.
+10.7334/psicothema2013.23.
+
+-   <https://www.sciencedirect.com/science/article/pii/S1051200419301289#bbr0610>
+
+-   <https://www.vexpower.com/brief/mean-absolute-percentage-error>
